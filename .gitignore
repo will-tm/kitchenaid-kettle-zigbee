@@ -1,0 +1,24 @@
+# Build output
+build/
+
+# Python virtual environment
+.venv/
+
+# SDK dependencies (downloaded by west)
+deps/
+
+# West workspace config (auto-generated)
+.west/
+
+# IDE
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*~
+*.bak
+*.swp

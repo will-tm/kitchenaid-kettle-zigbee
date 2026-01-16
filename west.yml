@@ -1,0 +1,25 @@
+# West manifest for KitchenAid 5KEK1522 Zigbee Kettle Controller
+# Uses ncs-zigbee add-on v1.2.1 (pulls in nRF Connect SDK v2.9.2)
+#
+# Setup (from this directory):
+#   mkdir .west && echo -e '[manifest]\npath = .\nfile = west.yml\n\n[zephyr]\nbase = deps/zephyr' > .west/config
+#   west update
+#   ./build.sh
+
+manifest:
+  version: "1.0"
+
+  remotes:
+    - name: ncs
+      url-base: https://github.com/nrfconnect
+
+  defaults:
+    remote: ncs
+
+  projects:
+    # Zigbee R23 add-on - provides Zigbee support and imports SDK v2.9.2
+    - name: ncs-zigbee
+      repo-path: ncs-zigbee
+      revision: v1.2.1
+      import:
+        path-prefix: deps

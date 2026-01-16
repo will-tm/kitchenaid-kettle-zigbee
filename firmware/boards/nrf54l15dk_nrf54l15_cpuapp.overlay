@@ -1,0 +1,231 @@
+/*
+ * Device Tree Overlay for KitchenAid Zigbee Kettle Controller
+ * Target: nRF54L15 DK / Custom nRF54L15 Hardware
+ *
+ * Pin Assignments:
+ * - Pairing Button:        P2.02 (sw0) - Active low with internal pull-up
+ * - Status LED:            P2.9  (led0) - Network status indication
+ * - Kettle State Input:    P2.03 - GPIO input to read kettle on/off state
+ * - Kettle Button Output:  P2.00 - GPIO output to simulate kettle button press
+ * - Target Temp ADC:       P1.06 (AIN2) - Via buffer, 0-2.5V after divider
+ * - Current Temp ADC:      P1.07 (AIN3) - Via buffer, 0-2.5V after divider
+ *
+ * IMPORTANT: Non-Intrusive ADC Interface
+ * =======================================
+ * nRF54L15 SAADC maximum input voltage is VDD (3.3V).
+ * The kettle's existing circuits output 0-5V and must NOT be loaded.
+ *
+ * Solution: Op-amp voltage follower buffer (high-Z input, low-Z output)
+ *
+ *   Kettle Signal (0-5V)
+ *         |
+ *         +---> [Op-Amp Buffer] --[10K]--+--[10K]-- GND
+ *               (e.g. MCP6001)           |
+ *               High-Z input          ADC Pin (0-2.5V)
+ *
+ * The op-amp buffer has >1M input impedance, so it won't affect
+ * the kettle's existing voltage divider circuits.
+ *
+ * Recommended op-amp: MCP6001 (rail-to-rail, 5V tolerant, SOT-23-5)
+ * Power from kettle's 5V supply.
+ *
+ * Flash partitions are handled by partition manager when MCUboot is enabled.
+ * nRF54L15 uses RRAM (resistive RAM) instead of traditional flash.
+ */
+
+#include <zephyr/dt-bindings/regulator/nrf5x.h>
+
+/*
+ * Override UART20 pinctrl to NOT use P1.06/P1.07 for RTS/CTS
+ * These pins are needed for ADC (AIN2/AIN3)
+ */
+&pinctrl {
+	uart20_default: uart20_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 4)>;
+		};
+		group2 {
+			psels = <NRF_PSEL(UART_RX, 1, 5)>;
+			bias-pull-up;
+		};
+	};
+
+	uart20_sleep: uart20_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 4)>,
+				<NRF_PSEL(UART_RX, 1, 5)>;
+			low-power-enable;
+		};
+	};
+};
+
+/ {
+	chosen {
+		zephyr,console = &uart20;
+		zephyr,shell-uart = &uart20;
+		ncs,zigbee-timer = &timer20;
+	};
+
+	aliases {
+		sw0 = &button0;
+		led0 = &led0;
+		kettle-state = &kettle_state_gpio;
+		kettle-button = &kettle_button_gpio;
+		adc-target-temp = &adc;
+		adc-current-temp = &adc;
+	};
+
+	/*
+	 * GPIO inputs accept 5V signals via N-MOSFET level shifters (2N7002)
+	 * MOSFET inverts the signal, so we use GPIO_ACTIVE_LOW
+	 *
+	 * 2N7002 SOT-23 pinout: Pin 1 (G), Pin 2 (S), Pin 3 (D)
+	 *
+	 * Connections:
+	 *   - Gate (G):   5V signal via 10K resistor
+	 *   - Source (S): GND
+	 *   - Drain (D):  GPIO pin (internal pull-up enabled)
+	 *
+	 * 5V HIGH -> MOSFET ON -> Drain LOW -> GPIO reads LOW (active)
+	 * 5V LOW  -> MOSFET OFF -> Drain HIGH -> GPIO reads HIGH (inactive)
+	 */
+
+	/* Button input - line goes HIGH when button pressed
+	 * Internal pull-up allows the line to go high when button is not pressed
+	 */
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio2 2 (GPIO_PULL_UP | GPIO_ACTIVE_HIGH)>;
+			label = "Pairing Button";
+		};
+	};
+
+	/* Status LED */
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio2 9 GPIO_ACTIVE_HIGH>;
+			label = "Status LED";
+		};
+	};
+
+	/*
+	 * Kettle state input - detects 5V 50% PWM at ~150Hz (ON) vs LOW (OFF)
+	 *
+	 * 10K resistor + 10µF capacitor (τ=100ms) smooths PWM to ~2.5V DC:
+	 *
+	 *   5V PWM --[10K]--+-- Gate (G)
+	 *                   |
+	 *                [10µF]
+	 *                   |
+	 *                  GND
+	 *
+	 * PWM present (50%) → Cap smooths to ~2.5V DC → MOSFET ON → GPIO LOW
+	 * No PWM (LOW)      → Cap discharges → MOSFET OFF → GPIO HIGH
+	 */
+	kettle_inputs {
+		compatible = "gpio-keys";
+		kettle_state_gpio: kettle_state {
+			gpios = <&gpio2 3 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Kettle On/Off State";
+		};
+	};
+
+	/*
+	 * Kettle button output - simulates physical button press
+	 *
+	 * Uses 2N7002 MOSFET as open-drain output to pull 5V line low:
+	 *
+	 *   Kettle 5V Button Line ----+---- Drain (D)
+	 *                             |
+	 *                          [2N7002]
+	 *                          G      S
+	 *                          |      |
+	 *            P2.00 --------+     GND
+	 *
+	 * GPIO HIGH (3.3V) → MOSFET ON → Pulls 5V line LOW (button pressed)
+	 * GPIO LOW         → MOSFET OFF → Line floats HIGH (button released)
+	 */
+	kettle_outputs {
+		compatible = "gpio-leds";
+		kettle_button_gpio: kettle_button {
+			gpios = <&gpio2 0 GPIO_ACTIVE_HIGH>;
+			label = "Kettle Button Simulate";
+		};
+	};
+
+	/* ADC channels for temperature sensing */
+	zephyr,user {
+		io-channels = <&adc 0>, <&adc 1>;
+		io-channel-names = "target_temp", "current_temp";
+	};
+};
+
+&timer20 {
+	status = "okay";
+};
+
+/* Use LDO mode (DCDC not available on all custom hardware) */
+&vregmain {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+/* ADC configuration for temperature sensing
+ * nRF54L15 SAADC analog inputs
+ *
+ * ADC Configuration:
+ *   Reference: Internal 0.9V (nRF54L15)
+ *   Gain: 1/4 (ADC_GAIN_1_4 maps to Gain2_8 on nRF54L15)
+ *   Max input: 0.9V * 4 = 3.6V
+ *   Expected input: 0-2.5V (from 5V through 10K-10K divider)
+ */
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	/* Channel 0: Target temperature (linear pot via buffer + voltage divider)
+	 * Physical pin: P1.06 (AIN2 on nRF54L15)
+	 */
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_AIN2>;
+		zephyr,resolution = <12>;
+	};
+
+	/* Channel 1: Current temperature (NTC via buffer + voltage divider)
+	 * Physical pin: P1.07 (AIN3 on nRF54L15)
+	 */
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_AIN3>;
+		zephyr,resolution = <12>;
+	};
+};
+
+/* Enable GPIOTE for GPIO interrupts */
+&gpiote20 {
+	status = "okay";
+};
+
+&gpiote30 {
+	status = "okay";
+};
+
+/* Enable GPIO ports with GPIOTE bindings for interrupt support */
+&gpio1 {
+	status = "okay";
+	gpiote-instance = <&gpiote20>;
+};
+
+&gpio2 {
+	status = "okay";
+	gpiote-instance = <&gpiote30>;
+};

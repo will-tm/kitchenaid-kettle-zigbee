@@ -1,0 +1,8 @@
+# Zephyr/nRF Connect SDK build dependencies
+west>=1.0.0
+pynrfjprog>=10.0.0
+intelhex>=2.0.0
+PyYAML>=6.0  # Pin to modern version (nrfutil conflicts but isn't needed)
+cbor2>=5.0  # Required for DFU multi-image packaging
+pyelftools>=0.29  # Required for Zephyr build scripts
+cryptography>=41.0  # Required for MCUboot imgtool signing

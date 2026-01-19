@@ -1,0 +1,114 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    name: Build nrf54l15dk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Cache West modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            .west
+          key: west-${{ hashFiles('west.yml') }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git cmake ninja-build gperf ccache dfu-util \
+            device-tree-compiler wget xz-utils file make gcc \
+            gcc-multilib g++-multilib libsdl2-dev libmagic1
+
+      - name: Install Zephyr SDK
+        run: |
+          cd ~
+          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz
+          cd zephyr-sdk-0.16.8
+          ./setup.sh -t arm-zephyr-eabi -h -c
+          echo "ZEPHYR_SDK_INSTALL_DIR=$HOME/zephyr-sdk-0.16.8" >> $GITHUB_ENV
+
+      - name: Setup Python environment
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+
+      - name: Initialize West workspace
+        run: |
+          source .venv/bin/activate
+          if [ ! -f ".west/config" ]; then
+            mkdir -p .west
+            cat > .west/config << 'EOF'
+          [manifest]
+          path = .
+          file = west.yml
+
+          [zephyr]
+          base = deps/zephyr
+          EOF
+          fi
+
+      - name: Update West modules
+        run: |
+          source .venv/bin/activate
+          west update --narrow -o=--depth=1
+
+      - name: Install additional Python deps
+        run: |
+          source .venv/bin/activate
+          pip install -r deps/zephyr/scripts/requirements-base.txt
+          pip install -r deps/bootloader/mcuboot/scripts/requirements.txt
+          pip install -r deps/nrf/scripts/requirements-build.txt
+
+      - name: Build firmware
+        run: |
+          source .venv/bin/activate
+          ./build.sh nrf54l15dk clean
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          BUILD_OUT="build/firmware/zephyr"
+          echo "Using build output from: $BUILD_OUT"
+          ls -la $BUILD_OUT/ || true
+
+          # Copy available artifacts
+          [ -f "$BUILD_OUT/zephyr.hex" ] && cp "$BUILD_OUT/zephyr.hex" artifacts/kitchenaid-kettle-nrf54l15dk.hex
+          [ -f "$BUILD_OUT/zephyr.bin" ] && cp "$BUILD_OUT/zephyr.bin" artifacts/kitchenaid-kettle-nrf54l15dk.bin
+
+          ls -la artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-nrf54l15dk
+          path: artifacts/
+          retention-days: 30

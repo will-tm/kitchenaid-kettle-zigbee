@@ -94,7 +94,7 @@ typedef enum {
  * Higher value = more smoothing, slower response
  * 4 = moderate smoothing, 8 = heavy smoothing
  */
-#define ADC_FILTER_COEFF        4
+#define ADC_FILTER_COEFF        8
 
 /* ==========================================================================
  * Device Tree
@@ -226,33 +226,46 @@ ZB_ZCL_DECLARE_GROUPS_ATTRIB_LIST(
 	groups_attr_list,
 	&dev_ctx.groups_attr.name_support);
 
-/* On/Off attribute list (read-only reporting of kettle state) */
+/* On/Off attribute list (controllable kettle state) */
 ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(on_off_attr_list, ZB_ZCL_ON_OFF)
-ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, (&dev_ctx.on_off_attr.on_off))
+ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+	(&dev_ctx.on_off_attr.on_off),
+	ZB_ZCL_ATTR_TYPE_BOOL,
+	ZB_ZCL_ATTR_ACCESS_READ_WRITE | ZB_ZCL_ATTR_ACCESS_REPORTING)
 ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
-/* Thermostat cluster attributes */
+/* Thermostat cluster attributes
+ * Use _M macro for attributes that need reporting access flag
+ */
 ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(thermostat_attr_list, ZB_ZCL_THERMOSTAT)
-ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
-	(&dev_ctx.thermostat_attr.local_temperature))
+ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
+	(&dev_ctx.thermostat_attr.local_temperature),
+	ZB_ZCL_ATTR_TYPE_S16,
+	ZB_ZCL_ATTR_ACCESS_READ_ONLY | ZB_ZCL_ATTR_ACCESS_REPORTING)
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID,
 	(&dev_ctx.thermostat_attr.occupied_cooling_setpoint))
-ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
-	(&dev_ctx.thermostat_attr.occupied_heating_setpoint))
+ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
+	(&dev_ctx.thermostat_attr.occupied_heating_setpoint),
+	ZB_ZCL_ATTR_TYPE_S16,
+	ZB_ZCL_ATTR_ACCESS_READ_WRITE | ZB_ZCL_ATTR_ACCESS_REPORTING)
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_MIN_HEAT_SETPOINT_LIMIT_ID,
 	(&dev_ctx.thermostat_attr.min_heat_setpoint_limit))
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_MAX_HEAT_SETPOINT_LIMIT_ID,
 	(&dev_ctx.thermostat_attr.max_heat_setpoint_limit))
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_CONTROL_SEQUENCE_OF_OPERATION_ID,
 	(&dev_ctx.thermostat_attr.control_sequence))
-ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
-	(&dev_ctx.thermostat_attr.system_mode))
+ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
+	(&dev_ctx.thermostat_attr.system_mode),
+	ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
+	ZB_ZCL_ATTR_ACCESS_READ_WRITE | ZB_ZCL_ATTR_ACCESS_REPORTING)
 ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
 /* Temperature measurement cluster attributes */
 ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(temp_measurement_attr_list, ZB_ZCL_TEMP_MEASUREMENT)
-ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-	(&dev_ctx.temp_measurement_attr.measured_value))
+ZB_ZCL_SET_ATTR_DESC_M(ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+	(&dev_ctx.temp_measurement_attr.measured_value),
+	ZB_ZCL_ATTR_TYPE_S16,
+	ZB_ZCL_ATTR_ACCESS_READ_ONLY | ZB_ZCL_ATTR_ACCESS_REPORTING)
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_TEMP_MEASUREMENT_MIN_VALUE_ID,
 	(&dev_ctx.temp_measurement_attr.min_measured_value))
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_TEMP_MEASUREMENT_MAX_VALUE_ID,
@@ -436,9 +449,10 @@ static int16_t adc_to_current_temp(int16_t adc_val)
  * ADC Sampling
  * ========================================================================== */
 
-/* Forward declaration for report function */
-static void send_single_report(zb_uint16_t cluster_id, zb_uint16_t attr_id,
-			       zb_uint8_t attr_type, void *value, zb_uint8_t value_size);
+/* Forward declarations for reporting helpers */
+static void mark_attribute_changed(zb_uint8_t endpoint, zb_uint16_t cluster_id,
+				   zb_uint16_t attr_id);
+static void schedule_state_report(void);
 
 static void update_temperatures(void)
 {
@@ -491,13 +505,9 @@ static void update_temperatures(void)
 				(zb_uint8_t *)&target_temp,
 				ZB_FALSE);
 
-			/* Send report immediately */
-			if (ZB_JOINED()) {
-				send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-					ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
-					ZB_ZCL_ATTR_TYPE_S16,
-					&target_temp, sizeof(target_temp));
-			}
+			/* Mark for reporting - stack will send based on configured intervals */
+			mark_attribute_changed(KETTLE_ENDPOINT, ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+				ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID);
 
 			save_kettle_state();
 			LOG_INF("Target temp updated to %d.%02d°C", target_temp / 100, target_temp % 100);
@@ -546,19 +556,13 @@ static void update_temperatures(void)
 					(zb_uint8_t *)&current_temp,
 					ZB_FALSE);
 
-				if (ZB_JOINED()) {
-					send_single_report(ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-						ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-						ZB_ZCL_ATTR_TYPE_S16,
-						&current_temp, sizeof(current_temp));
+				/* Mark attributes for reporting */
+				mark_attribute_changed(KETTLE_ENDPOINT, ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+					ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID);
+				mark_attribute_changed(KETTLE_ENDPOINT, ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+					ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
 
-					send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-						ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
-						ZB_ZCL_ATTR_TYPE_S16,
-						&current_temp, sizeof(current_temp));
-				}
-
-				LOG_INF("Kettle off base - reported to Zigbee");
+				LOG_INF("Kettle off base - marked for reporting");
 			}
 		} else {
 			/* Apply EMA filter to ADC reading */
@@ -611,18 +615,11 @@ static void update_temperatures(void)
 						(zb_uint8_t *)&current_temp,
 						ZB_FALSE);
 
-					/* Send reports immediately */
-					if (ZB_JOINED()) {
-						send_single_report(ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-							ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-							ZB_ZCL_ATTR_TYPE_S16,
-							&current_temp, sizeof(current_temp));
-
-						send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-							ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
-							ZB_ZCL_ATTR_TYPE_S16,
-							&current_temp, sizeof(current_temp));
-					}
+					/* Mark attributes for reporting - stack manages timing */
+					mark_attribute_changed(KETTLE_ENDPOINT, ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+						ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID);
+					mark_attribute_changed(KETTLE_ENDPOINT, ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+						ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
 
 					LOG_INF("Current temp: %d.%02d°C", current_temp / 100, current_temp % 100);
 				}
@@ -683,19 +680,8 @@ static void report_kettle_on_off(zb_bool_t on)
 		&system_mode,
 		ZB_FALSE);
 
-	/* Send reports immediately */
-	if (ZB_JOINED()) {
-		zb_uint8_t on_off_val = on;
-		send_single_report(ZB_ZCL_CLUSTER_ID_ON_OFF,
-			ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
-			ZB_ZCL_ATTR_TYPE_BOOL,
-			&on_off_val, sizeof(on_off_val));
-
-		send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-			ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
-			ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
-			&system_mode, sizeof(system_mode));
-	}
+	/* Schedule immediate report via ZBOSS callback */
+	schedule_state_report();
 
 	LOG_INF("Kettle state changed: %s (system_mode=%d)", on ? "ON" : "OFF", system_mode);
 }
@@ -1066,115 +1052,127 @@ static int adc_init(void)
 	return 0;
 }
 
-/* Periodic reporting work handler */
-static struct k_work_delayable periodic_report_work;
+/* ==========================================================================
+ * Zigbee Reporting
+ *
+ * Hybrid approach:
+ * - Temperature: Uses stack's automatic reporting (frequent, benefits from
+ *   stack-managed timing and buffering)
+ * - On/Off + System Mode: Manual report via ZBOSS callback (infrequent state
+ *   changes need immediate feedback to coordinator)
+ * ========================================================================== */
 
-#define PERIODIC_REPORT_INTERVAL_MS 30000  /* Report every 30 seconds */
+/* Forward declarations for ZBOSS callbacks */
+static void send_state_report_cb(zb_uint8_t param);
+static void send_system_mode_report_cb(zb_uint8_t param);
 
 /**
- * Send a single attribute report to the coordinator using raw packet building
+ * Mark an attribute as changed to trigger the stack's automatic reporting.
+ * Used for temperature attributes where timing isn't critical.
  */
-static void send_single_report(zb_uint16_t cluster_id, zb_uint16_t attr_id,
-			       zb_uint8_t attr_type, void *value, zb_uint8_t value_size)
+static void mark_attribute_changed(zb_uint8_t endpoint, zb_uint16_t cluster_id,
+				   zb_uint16_t attr_id)
+{
+	zb_zcl_mark_attr_for_reporting(endpoint, cluster_id, ZB_ZCL_CLUSTER_SERVER_ROLE, attr_id);
+}
+
+/**
+ * ZBOSS callback to send on/off and system_mode reports.
+ * Runs in ZBOSS context for proper buffer management.
+ */
+static void send_state_report_cb(zb_uint8_t param)
 {
 	zb_bufid_t bufid;
 	zb_uint8_t *cmd_ptr;
 	zb_uint16_t dst_addr = 0x0000;  /* Coordinator */
 
-	bufid = zb_buf_get_out();
-	if (!bufid) {
-		LOG_WRN("No buffer for report");
+	if (!ZB_JOINED()) {
+		if (param) {
+			zb_buf_free(param);
+		}
 		return;
 	}
 
-	/* Build attribute report payload manually */
+	/* Get a buffer for the report */
+	bufid = param ? param : zb_buf_get_out();
+	if (!bufid) {
+		LOG_WRN("No buffer for state report, scheduling retry");
+		ZB_SCHEDULE_APP_ALARM(send_state_report_cb, 0, ZB_TIME_ONE_SECOND);
+		return;
+	}
+
+	/* Build On/Off report - frame control: server-to-client, global cmd, disable default response */
 	cmd_ptr = ZB_ZCL_START_PACKET(bufid);
-
-	/* Frame control: global command (0x00), server-to-client (0x08), disable default response (0x10) */
-	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* 0x00 | 0x08 | 0x10 */
-
-	/* Sequence number */
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* 0x08 (srv->cli) | 0x10 (disable default resp) */
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_GET_SEQ_NUM());
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_CMD_REPORT_ATTRIB);
 
-	/* Command ID: Report Attributes (0x0A) */
-	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x0A);
-
-	/* Attribute ID */
-	ZB_ZCL_PACKET_PUT_DATA16_VAL(cmd_ptr, attr_id);
-
-	/* Attribute type */
-	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, attr_type);
-
-	/* Attribute value */
-	ZB_ZCL_PACKET_PUT_DATA_N(cmd_ptr, value, value_size);
+	/* On/Off attribute */
+	ZB_ZCL_PACKET_PUT_DATA16_VAL(cmd_ptr, ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_ATTR_TYPE_BOOL);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, dev_ctx.on_off_attr.on_off);
 
 	ZB_ZCL_FINISH_PACKET(bufid, cmd_ptr)
+	ZB_ZCL_SEND_COMMAND_SHORT(bufid, dst_addr, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+				  1, KETTLE_ENDPOINT, ZB_AF_HA_PROFILE_ID,
+				  ZB_ZCL_CLUSTER_ID_ON_OFF, NULL);
 
-	/* Send to coordinator */
-	ZB_ZCL_SEND_COMMAND_SHORT(bufid,
-		dst_addr,
-		ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-		1,  /* Coordinator endpoint */
-		KETTLE_ENDPOINT,
-		ZB_AF_HA_PROFILE_ID,
-		cluster_id,
-		NULL);
+	LOG_INF("Sent on_off report: %d", dev_ctx.on_off_attr.on_off);
+
+	/* Schedule system_mode report (separate buffer needed) */
+	ZB_SCHEDULE_APP_CALLBACK(send_system_mode_report_cb, 0);
 }
 
-static void send_attribute_report(void)
+/**
+ * ZBOSS callback to send system_mode report.
+ */
+static void send_system_mode_report_cb(zb_uint8_t param)
 {
+	zb_bufid_t bufid;
+	zb_uint8_t *cmd_ptr;
+	zb_uint16_t dst_addr = 0x0000;  /* Coordinator */
+
 	if (!ZB_JOINED()) {
+		if (param) {
+			zb_buf_free(param);
+		}
 		return;
 	}
 
-	LOG_INF("Sending attribute reports to coordinator");
+	bufid = param ? param : zb_buf_get_out();
+	if (!bufid) {
+		LOG_WRN("No buffer for system_mode report, scheduling retry");
+		ZB_SCHEDULE_APP_ALARM(send_system_mode_report_cb, 0, ZB_TIME_ONE_SECOND);
+		return;
+	}
 
-	/* Report On/Off state */
-	zb_uint8_t on_off_val = dev_ctx.on_off_attr.on_off;
-	send_single_report(ZB_ZCL_CLUSTER_ID_ON_OFF,
-		ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
-		ZB_ZCL_ATTR_TYPE_BOOL,
-		&on_off_val, sizeof(on_off_val));
+	/* Build system_mode report - frame control: server-to-client, global cmd, disable default response */
+	cmd_ptr = ZB_ZCL_START_PACKET(bufid);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* 0x08 (srv->cli) | 0x10 (disable default resp) */
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_GET_SEQ_NUM());
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_CMD_REPORT_ATTRIB);
 
-	/* Report current temperature */
-	zb_int16_t temp_val = dev_ctx.temp_measurement_attr.measured_value;
-	send_single_report(ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-		ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-		ZB_ZCL_ATTR_TYPE_S16,
-		&temp_val, sizeof(temp_val));
+	/* System mode attribute */
+	ZB_ZCL_PACKET_PUT_DATA16_VAL(cmd_ptr, ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_ATTR_TYPE_8BIT_ENUM);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, dev_ctx.thermostat_attr.system_mode);
 
-	/* Report thermostat local temperature */
-	send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-		ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
-		ZB_ZCL_ATTR_TYPE_S16,
-		&temp_val, sizeof(temp_val));
+	ZB_ZCL_FINISH_PACKET(bufid, cmd_ptr)
+	ZB_ZCL_SEND_COMMAND_SHORT(bufid, dst_addr, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+				  1, KETTLE_ENDPOINT, ZB_AF_HA_PROFILE_ID,
+				  ZB_ZCL_CLUSTER_ID_THERMOSTAT, NULL);
 
-	/* Report thermostat setpoint */
-	zb_int16_t setpoint_val = dev_ctx.thermostat_attr.occupied_heating_setpoint;
-	send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-		ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
-		ZB_ZCL_ATTR_TYPE_S16,
-		&setpoint_val, sizeof(setpoint_val));
-
-	/* Report system mode */
-	zb_uint8_t mode_val = dev_ctx.thermostat_attr.system_mode;
-	send_single_report(ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-		ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
-		ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
-		&mode_val, sizeof(mode_val));
-
-	LOG_INF("Reports sent: on_off=%d, temp=%d, setpoint=%d, mode=%d",
-		on_off_val, temp_val, setpoint_val, mode_val);
+	LOG_INF("Sent system_mode report: %d", dev_ctx.thermostat_attr.system_mode);
 }
 
-static void periodic_report_work_handler(struct k_work *work)
+/**
+ * Schedule state reports via ZBOSS callback (proper context for buffer ops)
+ */
+static void schedule_state_report(void)
 {
-	ARG_UNUSED(work);
-
-	send_attribute_report();
-
-	/* Schedule next report */
-	k_work_schedule(&periodic_report_work, K_MSEC(PERIODIC_REPORT_INTERVAL_MS));
+	if (ZB_JOINED()) {
+		ZB_SCHEDULE_APP_CALLBACK(send_state_report_cb, 0);
+	}
 }
 
 static void configure_reporting(void)
@@ -1184,25 +1182,17 @@ static void configure_reporting(void)
 
 	LOG_INF("Configuring attribute reporting...");
 
-	/* Configure On/Off reporting */
-	memset(&rep_info, 0, sizeof(rep_info));
-	rep_info.direction = ZB_ZCL_CONFIGURE_REPORTING_SEND_REPORT;
-	rep_info.ep = KETTLE_ENDPOINT;
-	rep_info.cluster_id = ZB_ZCL_CLUSTER_ID_ON_OFF;
-	rep_info.cluster_role = ZB_ZCL_CLUSTER_SERVER_ROLE;
-	rep_info.attr_id = ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
-	rep_info.dst.profile_id = ZB_AF_HA_PROFILE_ID;
-	rep_info.dst.endpoint = 1;  /* Coordinator endpoint */
-	rep_info.dst.short_addr = 0x0000;  /* Coordinator address */
-	rep_info.u.send_info.min_interval = 0;
-	rep_info.u.send_info.max_interval = 60;
-	rep_info.u.send_info.delta.u8 = 1;
-	rep_info.flags = ZB_ZCL_REPORTING_SLOT_BUSY;
+	/* Note: On/Off and System Mode are reported manually via schedule_state_report()
+	 * to ensure immediate feedback. Only temperature attributes use automatic reporting. */
 
-	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
-	LOG_INF("On/Off reporting config: %s", ret == RET_OK ? "OK" : "FAILED");
-
-	/* Configure Temperature Measurement reporting */
+	/* Configure Temperature Measurement reporting
+	 * min_interval: 5s (responsive during active heating)
+	 * max_interval: 300s (heartbeat when idle)
+	 * delta: 50 = 0.5°C change threshold
+	 *
+	 * During boiling: ~0.3°C/sec rise, so reports every 5-10s
+	 * When idle: only heartbeat every 5 min
+	 */
 	memset(&rep_info, 0, sizeof(rep_info));
 	rep_info.direction = ZB_ZCL_CONFIGURE_REPORTING_SEND_REPORT;
 	rep_info.ep = KETTLE_ENDPOINT;
@@ -1210,17 +1200,17 @@ static void configure_reporting(void)
 	rep_info.cluster_role = ZB_ZCL_CLUSTER_SERVER_ROLE;
 	rep_info.attr_id = ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID;
 	rep_info.dst.profile_id = ZB_AF_HA_PROFILE_ID;
-	rep_info.dst.endpoint = 1;  /* Coordinator endpoint */
-	rep_info.dst.short_addr = 0x0000;  /* Coordinator address */
-	rep_info.u.send_info.min_interval = 10;
-	rep_info.u.send_info.max_interval = 60;
+	rep_info.dst.endpoint = 1;
+	rep_info.dst.short_addr = 0x0000;
+	rep_info.u.send_info.min_interval = 5;
+	rep_info.u.send_info.max_interval = 300;
 	rep_info.u.send_info.delta.s16 = 50;  /* 0.5°C change */
 	rep_info.flags = ZB_ZCL_REPORTING_SLOT_BUSY;
 
 	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
-	LOG_INF("Temp measurement reporting config: %s", ret == RET_OK ? "OK" : "FAILED");
+	LOG_INF("Temp measurement reporting: %s", ret == RET_OK ? "OK" : "FAILED");
 
-	/* Configure Thermostat local temperature reporting */
+	/* Configure Thermostat local temperature reporting (mirrors temp measurement) */
 	memset(&rep_info, 0, sizeof(rep_info));
 	rep_info.direction = ZB_ZCL_CONFIGURE_REPORTING_SEND_REPORT;
 	rep_info.ep = KETTLE_ENDPOINT;
@@ -1228,15 +1218,15 @@ static void configure_reporting(void)
 	rep_info.cluster_role = ZB_ZCL_CLUSTER_SERVER_ROLE;
 	rep_info.attr_id = ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID;
 	rep_info.dst.profile_id = ZB_AF_HA_PROFILE_ID;
-	rep_info.dst.endpoint = 1;  /* Coordinator endpoint */
-	rep_info.dst.short_addr = 0x0000;  /* Coordinator address */
-	rep_info.u.send_info.min_interval = 10;
-	rep_info.u.send_info.max_interval = 60;
+	rep_info.dst.endpoint = 1;
+	rep_info.dst.short_addr = 0x0000;
+	rep_info.u.send_info.min_interval = 5;
+	rep_info.u.send_info.max_interval = 300;
 	rep_info.u.send_info.delta.s16 = 50;  /* 0.5°C change */
 	rep_info.flags = ZB_ZCL_REPORTING_SLOT_BUSY;
 
 	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
-	LOG_INF("Thermostat local temp reporting config: %s", ret == RET_OK ? "OK" : "FAILED");
+	LOG_INF("Thermostat local temp reporting: %s", ret == RET_OK ? "OK" : "FAILED");
 
 	/* Configure Thermostat setpoint reporting */
 	memset(&rep_info, 0, sizeof(rep_info));
@@ -1246,20 +1236,17 @@ static void configure_reporting(void)
 	rep_info.cluster_role = ZB_ZCL_CLUSTER_SERVER_ROLE;
 	rep_info.attr_id = ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID;
 	rep_info.dst.profile_id = ZB_AF_HA_PROFILE_ID;
-	rep_info.dst.endpoint = 1;  /* Coordinator endpoint */
-	rep_info.dst.short_addr = 0x0000;  /* Coordinator address */
+	rep_info.dst.endpoint = 1;
+	rep_info.dst.short_addr = 0x0000;
 	rep_info.u.send_info.min_interval = 10;
-	rep_info.u.send_info.max_interval = 300;
-	rep_info.u.send_info.delta.s16 = 50;  /* 0.5°C change */
+	rep_info.u.send_info.max_interval = 3600;  /* Setpoint rarely changes */
+	rep_info.u.send_info.delta.s16 = 100;  /* 1.0°C change */
 	rep_info.flags = ZB_ZCL_REPORTING_SLOT_BUSY;
 
 	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
-	LOG_INF("Thermostat setpoint reporting config: %s", ret == RET_OK ? "OK" : "FAILED");
+	LOG_INF("Thermostat setpoint reporting: %s", ret == RET_OK ? "OK" : "FAILED");
 
-	LOG_INF("Attribute reporting configured, starting periodic reports");
-
-	/* Start periodic reporting as backup */
-	k_work_schedule(&periodic_report_work, K_MSEC(5000));  /* First report after 5s */
+	LOG_INF("Attribute reporting configured");
 }
 
 static void clusters_attr_init(void)
@@ -1531,8 +1518,8 @@ int main(void)
 		LOG_ERR("Settings init failed: %d", err);
 	}
 
-	/* Initialize periodic reporting work */
-	k_work_init_delayable(&periodic_report_work, periodic_report_work_handler);
+	/* Note: Reporting is handled by ZBOSS stack's built-in reporting mechanism
+	 * configured in configure_reporting(). No manual periodic reports needed. */
 
 #ifdef CONFIG_ZIGBEE_FOTA
 	/* Initialize OTA client */

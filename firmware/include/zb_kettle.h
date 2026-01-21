@@ -39,7 +39,7 @@
 	(ZB_KETTLE_IN_CLUSTER_NUM + ZB_KETTLE_OUT_CLUSTER_NUM)
 
 /** Number of attributes for reporting */
-#define ZB_KETTLE_REPORT_ATTR_COUNT 4  /* on_off, temp_measurement, local_temp, occupied_setpoint */
+#define ZB_KETTLE_REPORT_ATTR_COUNT 3  /* temp_measurement, local_temp, occupied_setpoint */
 
 /**
  * @brief Declare cluster list for Kettle device

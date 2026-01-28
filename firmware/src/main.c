@@ -798,6 +798,94 @@ static void health_monitor_work_handler(struct k_work *work)
 }
 
 /* ==========================================================================
+ * TX Power Configuration
+ * ========================================================================== */
+
+#ifdef CONFIG_KETTLE_TX_POWER
+
+/**
+ * Callback for TX power setting result.
+ */
+static void tx_power_cb(zb_bufid_t param)
+{
+	zb_tx_power_params_t *power_params = zb_buf_begin(param);
+	const char *status;
+
+	switch (power_params->status) {
+	case RET_OK:
+		status = "success";
+		break;
+	case RET_INVALID_PARAMETER_1:
+		status = "invalid page";
+		break;
+	case RET_INVALID_PARAMETER_2:
+		status = "invalid channel";
+		break;
+	case RET_INVALID_PARAMETER_3:
+		status = "invalid tx power";
+		break;
+	default:
+		status = "unknown error";
+		break;
+	}
+
+	LOG_INF("TX power set (ch: %d, pwr: %d dBm): %s",
+		power_params->channel, power_params->tx_power, status);
+
+	zb_buf_free(param);
+}
+
+/**
+ * Schedule TX power set for a specific channel.
+ */
+static void schedule_tx_power_set(zb_bufid_t param, zb_uint16_t channel)
+{
+	zb_tx_power_params_t *power_params;
+
+	power_params = zb_buf_initial_alloc(param, sizeof(zb_tx_power_params_t));
+
+	power_params->page = ZB_CHANNEL_PAGE0_2_4_GHZ;
+	power_params->channel = channel;
+	power_params->tx_power = CONFIG_KETTLE_TX_POWER;
+	power_params->cb = tx_power_cb;
+
+	ZB_SCHEDULE_APP_CALLBACK(zb_set_tx_power_async, param);
+}
+
+/**
+ * Set TX power for all configured Zigbee channels.
+ * 2.4 GHz Zigbee uses channels 11-26.
+ */
+static void set_tx_power(void)
+{
+	zb_ret_t ret;
+	uint32_t channel_mask;
+	uint8_t channel;
+
+#if defined(CONFIG_ZIGBEE_CHANNEL_SELECTION_MODE_SINGLE)
+	channel_mask = 1 << CONFIG_ZIGBEE_CHANNEL;
+#elif defined(CONFIG_ZIGBEE_CHANNEL_SELECTION_MODE_MULTI)
+	channel_mask = CONFIG_ZIGBEE_CHANNEL_MASK;
+#else
+	/* Default: all 2.4 GHz channels (11-26) */
+	channel_mask = 0x07FFF800;
+#endif
+
+	LOG_INF("Setting TX power to %d dBm", CONFIG_KETTLE_TX_POWER);
+
+	for (channel = 11; channel <= 26; channel++) {
+		if (channel_mask & (1 << channel)) {
+			ret = zb_buf_get_out_delayed_ext(schedule_tx_power_set, channel, 0);
+			if (ret != RET_OK) {
+				LOG_ERR("Failed to set TX power for channel %d: %d", channel, ret);
+			}
+		}
+	}
+}
+
+#endif /* CONFIG_KETTLE_TX_POWER */
+
+/* ==========================================================================
  * Kettle State Machine and GPIO Handling
  * ========================================================================== */
 
@@ -1861,6 +1949,9 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		LOG_INF("Device reboot (status=%d)", status);
 		if (status == RET_OK) {
 			LOG_INF("Joined Zigbee network as router");
+#ifdef CONFIG_KETTLE_TX_POWER
+			set_tx_power();
+#endif
 			configure_reporting();
 			/* Report initial values so coordinator has current state */
 			schedule_state_report();
@@ -1874,6 +1965,9 @@ void zboss_signal_handler(zb_bufid_t bufid)
 	case ZB_BDB_SIGNAL_STEERING:
 		if (status == RET_OK) {
 			LOG_INF("Network steering successful - joined!");
+#ifdef CONFIG_KETTLE_TX_POWER
+			set_tx_power();
+#endif
 			configure_reporting();
 			/* Report initial values so coordinator has current state */
 			schedule_state_report();

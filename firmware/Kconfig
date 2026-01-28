@@ -1,0 +1,16 @@
+# KitchenAid Kettle Kconfig
+
+menu "Kettle Configuration"
+
+config KETTLE_TX_POWER
+	int "Zigbee TX power in dBm"
+	default 8
+	range -20 8
+	help
+	  Set the Zigbee radio transmit power in dBm.
+	  Range: -20 to +8 dBm for nRF54L15.
+	  Higher values improve range but increase power consumption.
+
+endmenu
+
+source "Kconfig.zephyr"

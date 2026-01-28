@@ -22,7 +22,7 @@
 
 #include <zboss_api.h>
 #include <zboss_api_addons.h>
-#include <zb_mem_config_med.h>
+#include <zb_mem_config_max.h>  /* Use max buffers for router long-term stability */
 #include <zigbee/zigbee_app_utils.h>
 #include <zigbee/zigbee_error_handler.h>
 #include <zb_nrf_platform.h>
@@ -487,6 +487,7 @@ static int16_t adc_to_current_temp(int16_t adc_val)
 static void mark_attribute_changed(zb_uint8_t endpoint, zb_uint16_t cluster_id,
 				   zb_uint16_t attr_id);
 static void schedule_state_report(void);
+static void schedule_target_temp_report(void);
 
 /**
  * Comparison function for qsort to sort int16_t values ascending
@@ -609,7 +610,10 @@ static void update_temperatures(void)
 				(zb_uint8_t *)&target_temp,
 				ZB_FALSE);
 
-			/* Mark for reporting - stack will send based on configured intervals */
+			/* Send immediate manual report for responsive UI */
+			schedule_target_temp_report();
+
+			/* Also mark for stack's automatic reporting as backup */
 			mark_attribute_changed(KETTLE_ENDPOINT, ZB_ZCL_CLUSTER_ID_THERMOSTAT,
 				ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID);
 
@@ -1226,11 +1230,17 @@ static int adc_init(void)
 #define REPORT_MAX_DELAY_MS     10000
 
 static bool state_report_pending = false;
+static bool buffer_request_pending = false;  /* Guards zb_buf_get_out_delayed accumulation */
+static bool reporting_configured = false;    /* Prevents duplicate reporting setup on rejoin */
+static bool target_temp_report_pending = false;  /* For target temperature reports */
 
 /* Forward declarations for ZBOSS callbacks */
 static void send_state_report_cb(zb_uint8_t param);
 static void send_system_mode_report_cb(zb_uint8_t param);
+static void send_target_temp_report_cb(zb_uint8_t param);
 static void report_sent_cb(zb_uint8_t param);
+static void system_mode_sent_cb(zb_uint8_t param);
+static void target_temp_sent_cb(zb_uint8_t param);
 static void get_buffer_for_report_cb(zb_uint8_t param);
 
 /**
@@ -1244,7 +1254,7 @@ static void mark_attribute_changed(zb_uint8_t endpoint, zb_uint16_t cluster_id,
 }
 
 /**
- * Callback invoked when report packet is sent (APS ACK received or expired).
+ * Callback invoked when on_off report packet is sent (APS ACK received or expired).
  * Per Nordic docs: callback is called on APS ACK or command expiry.
  * Buffer is automatically freed by the stack after this callback returns.
  */
@@ -1252,10 +1262,34 @@ static void report_sent_cb(zb_uint8_t param)
 {
 	/* Buffer is freed by stack after callback - just log success */
 	if (param) {
-		LOG_DBG("Report sent callback, buf=%d", param);
+		LOG_DBG("On/off report sent callback, buf=%d", param);
 	}
-	/* Reset retry count on successful send */
+	/* Reset retry count on delivery confirmation */
 	state_report_retry_count = 0;
+}
+
+/**
+ * Callback invoked when system_mode report packet is sent.
+ * Separate from report_sent_cb to correctly track system_mode retries.
+ */
+static void system_mode_sent_cb(zb_uint8_t param)
+{
+	if (param) {
+		LOG_DBG("System_mode report sent callback, buf=%d", param);
+	}
+	/* Reset retry count on delivery confirmation */
+	system_mode_retry_count = 0;
+}
+
+/**
+ * Callback invoked when target_temp report packet is sent.
+ */
+static void target_temp_sent_cb(zb_uint8_t param)
+{
+	if (param) {
+		LOG_DBG("Target temp report sent callback, buf=%d", param);
+	}
+	target_temp_report_pending = false;
 }
 
 /**
@@ -1264,6 +1298,8 @@ static void report_sent_cb(zb_uint8_t param)
  */
 static void get_buffer_for_report_cb(zb_uint8_t param)
 {
+	buffer_request_pending = false;  /* Clear guard - we got our callback */
+
 	if (param) {
 		/* Got a buffer, send the report */
 		send_state_report_cb(param);
@@ -1288,12 +1324,14 @@ static void send_state_report_cb(zb_uint8_t param)
 	zb_uint16_t dst_addr = 0x0000;  /* Coordinator */
 	zb_ret_t ret;
 
-	state_report_pending = false;
+	/* Note: Don't clear state_report_pending here - only after buffer acquired */
 
 	if (!ZB_JOINED()) {
 		if (param) {
 			zb_buf_free(param);
 		}
+		state_report_pending = false;
+		buffer_request_pending = false;
 		LOG_DBG("Not joined, skipping state report");
 		return;
 	}
@@ -1313,25 +1351,36 @@ static void send_state_report_cb(zb_uint8_t param)
 				}
 
 				state_report_retry_count++;
-				state_report_pending = true;
+				/* state_report_pending stays true during retry */
 				LOG_WRN("No buffer for state report, retry %d/%d in %dms",
 					state_report_retry_count, REPORT_MAX_RETRIES, delay_ms);
 
-				/* Use delayed buffer allocation - more efficient than polling */
-				ret = zb_buf_get_out_delayed(get_buffer_for_report_cb);
-				if (ret != RET_OK) {
-					/* Fallback to alarm-based retry */
-					ZB_SCHEDULE_APP_ALARM(send_state_report_cb, 0,
-						ZB_MILLISECONDS_TO_BEACON_INTERVAL(delay_ms));
+				/* Use delayed buffer allocation - guard against accumulation */
+				if (!buffer_request_pending) {
+					buffer_request_pending = true;
+					ret = zb_buf_get_out_delayed(get_buffer_for_report_cb);
+					if (ret != RET_OK) {
+						buffer_request_pending = false;
+						/* Fallback to alarm-based retry */
+						ZB_SCHEDULE_APP_ALARM(send_state_report_cb, 0,
+							ZB_MILLISECONDS_TO_BEACON_INTERVAL(delay_ms));
+					}
 				}
+				/* else: delayed request already pending, it will call us back */
 			} else {
 				LOG_ERR("State report failed after %d retries - buffer exhaustion",
 					REPORT_MAX_RETRIES);
 				state_report_retry_count = 0;
+				state_report_pending = false;
+				buffer_request_pending = false;
 			}
 			return;
 		}
 	}
+
+	/* Successfully acquired buffer - now safe to clear pending flag */
+	state_report_pending = false;
+	buffer_request_pending = false;
 
 	/* Build combined report with BOTH on_off and system_mode attributes
 	 * This is more efficient than two separate reports:
@@ -1421,13 +1470,13 @@ static void send_system_mode_report_cb(zb_uint8_t param)
 
 	ZB_ZCL_FINISH_PACKET(bufid, cmd_ptr)
 
-	/* Send with callback for proper buffer management */
+	/* Send with callback for proper buffer management and retry tracking */
 	ZB_ZCL_SEND_COMMAND_SHORT(bufid, dst_addr, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
 				  1, KETTLE_ENDPOINT, ZB_AF_HA_PROFILE_ID,
-				  ZB_ZCL_CLUSTER_ID_THERMOSTAT, report_sent_cb);
+				  ZB_ZCL_CLUSTER_ID_THERMOSTAT, system_mode_sent_cb);
 
 	LOG_INF("Sent system_mode report: %d", dev_ctx.thermostat_attr.system_mode);
-	system_mode_retry_count = 0;
+	/* Note: retry count reset moved to system_mode_sent_cb callback */
 }
 
 /**
@@ -1451,10 +1500,83 @@ static void schedule_state_report(void)
 	ZB_SCHEDULE_APP_CALLBACK(send_state_report_cb, 0);
 }
 
+/**
+ * ZBOSS callback to send target temperature (setpoint) report.
+ * Provides immediate feedback when user adjusts the dial.
+ */
+static void send_target_temp_report_cb(zb_uint8_t param)
+{
+	zb_bufid_t bufid;
+	zb_uint8_t *cmd_ptr;
+	zb_uint16_t dst_addr = 0x0000;  /* Coordinator */
+
+	if (!ZB_JOINED()) {
+		if (param) {
+			zb_buf_free(param);
+		}
+		target_temp_report_pending = false;
+		return;
+	}
+
+	bufid = param ? param : zb_buf_get_out();
+	if (!bufid) {
+		/* No buffer - skip this report, automatic reporting will catch it later */
+		LOG_WRN("No buffer for target temp report, relying on auto-report");
+		target_temp_report_pending = false;
+		return;
+	}
+
+	/* Build setpoint report */
+	cmd_ptr = ZB_ZCL_START_PACKET(bufid);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* Frame ctrl: srv->cli | disable default resp */
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_GET_SEQ_NUM());
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_CMD_REPORT_ATTRIB);
+
+	/* Occupied heating setpoint attribute */
+	ZB_ZCL_PACKET_PUT_DATA16_VAL(cmd_ptr, ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID);
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_ATTR_TYPE_S16);
+	ZB_ZCL_PACKET_PUT_DATA16_VAL(cmd_ptr, dev_ctx.thermostat_attr.occupied_heating_setpoint);
+
+	ZB_ZCL_FINISH_PACKET(bufid, cmd_ptr)
+
+	ZB_ZCL_SEND_COMMAND_SHORT(bufid, dst_addr, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+				  1, KETTLE_ENDPOINT, ZB_AF_HA_PROFILE_ID,
+				  ZB_ZCL_CLUSTER_ID_THERMOSTAT, target_temp_sent_cb);
+
+	LOG_INF("Sent target temp report: %d.%02d C",
+		dev_ctx.thermostat_attr.occupied_heating_setpoint / 100,
+		dev_ctx.thermostat_attr.occupied_heating_setpoint % 100);
+}
+
+/**
+ * Schedule immediate target temperature report.
+ */
+static void schedule_target_temp_report(void)
+{
+	if (!ZB_JOINED()) {
+		return;
+	}
+
+	/* Debounce: don't queue another report if one is already pending */
+	if (target_temp_report_pending) {
+		LOG_DBG("Target temp report already pending, skipping duplicate");
+		return;
+	}
+
+	target_temp_report_pending = true;
+	ZB_SCHEDULE_APP_CALLBACK(send_target_temp_report_cb, 0);
+}
+
 static void configure_reporting(void)
 {
 	zb_zcl_reporting_info_t rep_info;
 	zb_ret_t ret;
+
+	/* Guard against reconfiguration on network rejoin - slots are limited */
+	if (reporting_configured) {
+		LOG_INF("Reporting already configured, skipping reconfiguration");
+		return;
+	}
 
 	LOG_INF("Configuring attribute reporting...");
 
@@ -1563,6 +1685,7 @@ static void configure_reporting(void)
 	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
 	LOG_INF("Thermostat setpoint reporting: %s", ret == RET_OK ? "OK" : "FAILED");
 
+	reporting_configured = true;
 	LOG_INF("Attribute reporting configured (5 slots used)");
 }
 
@@ -1739,6 +1862,9 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		if (status == RET_OK) {
 			LOG_INF("Joined Zigbee network as router");
 			configure_reporting();
+			/* Report initial values so coordinator has current state */
+			schedule_state_report();
+			schedule_target_temp_report();
 		} else {
 			LOG_INF("Not joined, starting network steering...");
 			bdb_start_top_level_commissioning(ZB_BDB_NETWORK_STEERING);
@@ -1749,6 +1875,9 @@ void zboss_signal_handler(zb_bufid_t bufid)
 		if (status == RET_OK) {
 			LOG_INF("Network steering successful - joined!");
 			configure_reporting();
+			/* Report initial values so coordinator has current state */
+			schedule_state_report();
+			schedule_target_temp_report();
 		} else {
 			LOG_WRN("Network steering failed (status=%d), retrying...", status);
 			bdb_start_top_level_commissioning(ZB_BDB_NETWORK_STEERING);
@@ -1780,10 +1909,10 @@ int main(void)
 	int err;
 
 	LOG_INF("========================================");
-	LOG_INF("KitchenAid 5KEK1522 Zigbee Kettle v1.1.0");
+	LOG_INF("KitchenAid 5KEK1522 Zigbee Kettle v1.2.0");
 	LOG_INF("Board: %s", CONFIG_BOARD);
-	LOG_INF("Role: Zigbee Router");
-	LOG_INF("Fixes: Buffer mgmt, report reliability");
+	LOG_INF("Role: Zigbee Router (max buffers)");
+	LOG_INF("Fixes: Race conditions, buffer exhaustion");
 	LOG_INF("========================================");
 
 	/* Initialize status LED */

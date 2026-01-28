@@ -18,6 +18,7 @@
 #include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
+#include <stdlib.h>
 
 #include <zboss_api.h>
 #include <zboss_api_addons.h>
@@ -94,7 +95,15 @@ typedef enum {
  * Higher value = more smoothing, slower response
  * 4 = moderate smoothing, 8 = heavy smoothing
  */
-#define ADC_FILTER_COEFF        8
+#define ADC_FILTER_COEFF        4
+
+/* Burst sampling configuration for pulsed signals
+ * The current temperature signal is pulsed at ~50Hz (20ms period).
+ * We sample rapidly and take the minimum to get the true value.
+ */
+#define BURST_SAMPLE_COUNT      80      /* Number of samples in burst */
+#define BURST_SAMPLE_INTERVAL_US 500    /* 0.5ms between samples = 40ms total window */
+#define BURST_PERCENTILE_INDEX  8       /* 10th percentile (8th lowest of 80) */
 
 /* ==========================================================================
  * Device Tree
@@ -172,6 +181,9 @@ static struct k_work_delayable health_monitor_work;
 
 /* ADC buffer and sequence (configured per-read) */
 static int16_t adc_buffer;
+
+/* Burst sample buffer for pulsed signal detection */
+static int16_t burst_samples[BURST_SAMPLE_COUNT];
 
 /* EMA filtered ADC values (initialized to -1 to indicate first sample) */
 static int32_t adc_target_filtered = -1;
@@ -374,29 +386,43 @@ static int16_t adc_to_target_temp(int16_t adc_val)
 
 /**
  * Convert ADC value to temperature for NTC thermistor (current temperature)
- * Uses calibrated lookup table with linear interpolation.
+ * Uses physics-based lookup table derived from NTC thermistor equation.
  *
- * Circuit: 5V -> NTC -> NTC_junction -> 10K -> GND
- * We read NTC_junction through buffer + 2:1 divider
+ * Circuit: 5V -> R_fixed -> junction -> NTC -> GND
+ * V_junction = Vcc * R_ntc / (R_fixed + R_ntc)
+ * We read junction through op-amp buffer + 2:1 divider
  *
- * Calibration points (original voltage before divider):
- *   1200mV = 25°C,  1900mV = 50°C,  2200mV = 70°C
- *   3000mV = 90°C,  3300mV = 100°C
+ * NTC model: R(T) = R25 * exp(Beta * (1/T - 1/298.15))
+ * Fitted from empirical data:
+ *   - Ambient ~20°C at ~1076mV (log start)
+ *   - Boiling ~99°C at ~3260mV (log end)
+ *   - Derived Beta ≈ 2720K
+ *
+ * Physics-based calibration points (voltage before 2:1 divider):
  */
 
 /* Voltage threshold below which kettle is considered off base (mV, before divider) */
-#define KETTLE_OFF_BASE_MV      1000
+#define KETTLE_OFF_BASE_MV      750
 
-/* Lookup table: {voltage_mv, temp_zb} - voltage is BEFORE the 2:1 divider */
+/* Lookup table: {voltage_mv, temp_zb} - voltage is BEFORE the 2:1 divider
+ * Derived from NTC physics with Beta=2720K, anchored to measured endpoints.
+ * More points in non-linear regions for better interpolation accuracy.
+ */
 static const struct {
 	int16_t voltage_mv;
 	int16_t temp_zb;
 } current_temp_lut[] = {
-	{ 1200,  2500 },  /* 1.2V = 25°C */
-	{ 1900,  5000 },  /* 1.9V = 50°C */
-	{ 2200,  7000 },  /* 2.2V = 70°C */
-	{ 3000,  9000 },  /* 3.0V = 90°C */
-	{ 3300, 10000 },  /* 3.3V = 100°C */
+	{ 1060,  2000 },  /* 1.06V = 20°C (ambient baseline) */
+	{ 1180,  2500 },  /* 1.18V = 25°C */
+	{ 1440,  3500 },  /* 1.44V = 35°C */
+	{ 1720,  4500 },  /* 1.72V = 45°C */
+	{ 2000,  5500 },  /* 2.00V = 55°C */
+	{ 2260,  6500 },  /* 2.26V = 65°C */
+	{ 2500,  7500 },  /* 2.50V = 75°C */
+	{ 2720,  8500 },  /* 2.72V = 85°C */
+	{ 2900,  9500 },  /* 2.90V = 95°C */
+	{ 3000,  9900 },  /* 3.00V = 99°C */
+	{ 3260, 10000 },  /* 3.26V = 100°C (boiling ceiling) */
 };
 #define CURRENT_TEMP_LUT_SIZE (sizeof(current_temp_lut) / sizeof(current_temp_lut[0]))
 
@@ -462,6 +488,76 @@ static void mark_attribute_changed(zb_uint8_t endpoint, zb_uint16_t cluster_id,
 				   zb_uint16_t attr_id);
 static void schedule_state_report(void);
 
+/**
+ * Comparison function for qsort to sort int16_t values ascending
+ */
+static int compare_int16(const void *a, const void *b)
+{
+	int16_t va = *(const int16_t *)a;
+	int16_t vb = *(const int16_t *)b;
+	return (va > vb) - (va < vb);
+}
+
+/**
+ * Perform burst sampling of an ADC channel to handle pulsed signals.
+ *
+ * The current temperature signal is pulsed at ~50Hz - it goes high during
+ * part of each cycle. By sampling rapidly over multiple cycles and taking
+ * a low percentile, we capture the true analog level when the pulse is low.
+ *
+ * @param adc_spec ADC channel to sample
+ * @return The 10th percentile ADC value, or -1 on error
+ */
+static int16_t burst_sample_adc(const struct adc_dt_spec *adc_spec)
+{
+	int ret;
+	struct adc_sequence sequence = {
+		.buffer = &adc_buffer,
+		.buffer_size = sizeof(adc_buffer),
+	};
+
+	/* Initialize sequence for this channel */
+	ret = adc_sequence_init_dt(adc_spec, &sequence);
+	if (ret != 0) {
+		LOG_WRN("Burst sample: sequence init failed: %d", ret);
+		return -1;
+	}
+
+	/* Collect burst samples */
+	for (int i = 0; i < BURST_SAMPLE_COUNT; i++) {
+		ret = adc_read_dt(adc_spec, &sequence);
+		if (ret != 0) {
+			LOG_WRN("Burst sample %d failed: %d", i, ret);
+			/* Fill remaining with invalid marker */
+			for (int j = i; j < BURST_SAMPLE_COUNT; j++) {
+				burst_samples[j] = INT16_MAX;
+			}
+			break;
+		}
+		burst_samples[i] = adc_buffer;
+
+		/* Wait before next sample (except after last) */
+		if (i < BURST_SAMPLE_COUNT - 1) {
+			k_busy_wait(BURST_SAMPLE_INTERVAL_US);
+		}
+	}
+
+	/* Sort samples to find percentile */
+	qsort(burst_samples, BURST_SAMPLE_COUNT, sizeof(int16_t), compare_int16);
+
+	/* Return the 10th percentile value (low but not minimum, for noise robustness) */
+	int16_t result = burst_samples[BURST_PERCENTILE_INDEX];
+
+	/* Log burst statistics for debugging */
+	LOG_DBG("Burst: min=%d, p10=%d, median=%d, max=%d",
+		burst_samples[0],
+		burst_samples[BURST_PERCENTILE_INDEX],
+		burst_samples[BURST_SAMPLE_COUNT / 2],
+		burst_samples[BURST_SAMPLE_COUNT - 1]);
+
+	return result;
+}
+
 static void update_temperatures(void)
 {
 	int ret;
@@ -524,24 +620,24 @@ static void update_temperatures(void)
 		LOG_WRN("Target temp ADC read failed: %d", ret);
 	}
 
-	/* Sample current temperature (channel 1) */
-	ret = adc_sequence_init_dt(&adc_current_temp, &sequence);
-	if (ret == 0) {
-		ret = adc_read_dt(&adc_current_temp, &sequence);
-	}
+	/* Sample current temperature (channel 1) using burst sampling
+	 * The temperature signal is pulsed at ~50Hz, so we take many rapid samples
+	 * and use the 10th percentile to get the true value when the pulse is low.
+	 */
+	int16_t burst_adc = burst_sample_adc(&adc_current_temp);
 
-	if (ret == 0) {
-		/* Calculate raw voltage first to check for off-base condition */
-		int32_t raw_adc_mv = (int32_t)adc_buffer * 3600 / ADC_MAX_VALUE;
-		int32_t raw_orig_mv = raw_adc_mv * ADC_DIVIDER_RATIO;
+	if (burst_adc >= 0) {
+		/* Calculate voltage from burst-sampled ADC value */
+		int32_t burst_adc_mv = (int32_t)burst_adc * 3600 / ADC_MAX_VALUE;
+		int32_t burst_orig_mv = burst_adc_mv * ADC_DIVIDER_RATIO;
 
-		/* Check if kettle is off base before filtering */
-		if (raw_orig_mv < KETTLE_OFF_BASE_MV) {
+		/* Check if kettle is off base */
+		if (burst_orig_mv < KETTLE_OFF_BASE_MV) {
 			/* Kettle off base - reset filter and report invalid */
 			adc_current_filtered = -1;
 			current_temp = TEMP_INVALID_ZB;
 
-			LOG_INF("Current: raw=%d, %dmV, OFF BASE (kettle lifted)", adc_buffer, raw_orig_mv);
+			LOG_INF("Current: burst_p10=%d, %dmV, OFF BASE (kettle lifted)", burst_adc, burst_orig_mv);
 
 			/* Report invalid temperature to Zigbee if it changed */
 			if (dev_ctx.temp_measurement_attr.measured_value != TEMP_INVALID_ZB) {
@@ -573,11 +669,11 @@ static void update_temperatures(void)
 				LOG_INF("Kettle off base - marked for reporting");
 			}
 		} else {
-			/* Apply EMA filter to ADC reading */
+			/* Apply EMA filter to burst-sampled ADC value */
 			if (adc_current_filtered < 0) {
-				adc_current_filtered = adc_buffer;  /* First sample */
+				adc_current_filtered = burst_adc;  /* First sample */
 			} else {
-				adc_current_filtered += (adc_buffer - adc_current_filtered) / ADC_FILTER_COEFF;
+				adc_current_filtered += (burst_adc - adc_current_filtered) / ADC_FILTER_COEFF;
 			}
 			int16_t filtered_adc = (int16_t)adc_current_filtered;
 
@@ -589,12 +685,12 @@ static void update_temperatures(void)
 			int16_t current_zb = dev_ctx.temp_measurement_attr.measured_value;
 
 			if (current_temp != TEMP_INVALID_ZB) {
-				LOG_INF("Current: raw=%d, filt=%d, %dmV, measured=%d.%02d°C, zigbee=%d.%02d°C",
-					adc_buffer, filtered_adc, orig_mv_cur,
+				LOG_INF("Current: burst_p10=%d, filt=%d, %dmV, measured=%d.%02d°C, zigbee=%d.%02d°C",
+					burst_adc, filtered_adc, orig_mv_cur,
 					current_temp / 100, current_temp % 100,
 					current_zb / 100, current_zb % 100);
 			} else {
-				LOG_INF("Current: raw=%d, filt=%d, %dmV, INVALID", adc_buffer, filtered_adc, orig_mv_cur);
+				LOG_INF("Current: burst_p10=%d, filt=%d, %dmV, INVALID", burst_adc, filtered_adc, orig_mv_cur);
 			}
 
 			if (current_temp != TEMP_INVALID_ZB) {
@@ -634,7 +730,7 @@ static void update_temperatures(void)
 			}
 		}  /* end of else (kettle on base) */
 	} else {
-		LOG_WRN("Current temp ADC read failed: %d", ret);
+		LOG_WRN("Current temp burst sampling failed");
 	}
 }
 

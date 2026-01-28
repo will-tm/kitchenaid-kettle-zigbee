@@ -38,8 +38,16 @@
 #define ZB_KETTLE_CLUSTER_NUM \
 	(ZB_KETTLE_IN_CLUSTER_NUM + ZB_KETTLE_OUT_CLUSTER_NUM)
 
-/** Number of attributes for reporting */
-#define ZB_KETTLE_REPORT_ATTR_COUNT 3  /* temp_measurement, local_temp, occupied_setpoint */
+/** Number of attributes for reporting
+ * Increased to handle all reportable attributes:
+ * - temp_measurement value
+ * - thermostat local_temp
+ * - thermostat occupied_heating_setpoint
+ * - on_off state
+ * - thermostat system_mode
+ * Plus spare slots for stack-initiated reports
+ */
+#define ZB_KETTLE_REPORT_ATTR_COUNT 8
 
 /**
  * @brief Declare cluster list for Kettle device

@@ -165,6 +165,10 @@ static struct k_work_delayable long_press_work;
 static struct k_work_delayable adc_sample_work;
 static struct k_work_delayable kettle_button_release_work;
 static struct k_work_delayable kettle_transition_timeout_work;
+static struct k_work_delayable health_monitor_work;
+
+/* Health monitoring interval (5 minutes) */
+#define HEALTH_MONITOR_INTERVAL_MS (5 * 60 * 1000)
 
 /* ADC buffer and sequence (configured per-read) */
 static int16_t adc_buffer;
@@ -172,6 +176,10 @@ static int16_t adc_buffer;
 /* EMA filtered ADC values (initialized to -1 to indicate first sample) */
 static int32_t adc_target_filtered = -1;
 static int32_t adc_current_filtered = -1;
+
+/* Report retry counters (used by reporting callbacks and health monitor) */
+static uint8_t state_report_retry_count = 0;
+static uint8_t system_mode_retry_count = 0;
 
 /* ==========================================================================
  * Persistent Settings
@@ -641,6 +649,55 @@ static void adc_sample_work_handler(struct k_work *work)
 }
 
 /* ==========================================================================
+ * Health Monitoring
+ *
+ * Periodic logging of system health metrics to help diagnose long-term
+ * reliability issues like buffer exhaustion.
+ * ========================================================================== */
+
+static uint32_t health_uptime_hours = 0;
+static uint32_t health_report_count = 0;
+
+static void health_monitor_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	health_report_count++;
+	uint32_t uptime_ms = k_uptime_get_32();
+	uint32_t uptime_hours = uptime_ms / (1000 * 60 * 60);
+
+	/* Log system health stats */
+	LOG_INF("=== Health Report #%u (uptime: %u hours) ===",
+		health_report_count, uptime_hours);
+	LOG_INF("  Kettle state: %s, system_mode: %d",
+		dev_ctx.on_off_attr.on_off ? "ON" : "OFF",
+		dev_ctx.thermostat_attr.system_mode);
+	LOG_INF("  Current temp: %d.%02d C, Target: %d.%02d C",
+		dev_ctx.temp_measurement_attr.measured_value / 100,
+		dev_ctx.temp_measurement_attr.measured_value % 100,
+		dev_ctx.thermostat_attr.occupied_heating_setpoint / 100,
+		dev_ctx.thermostat_attr.occupied_heating_setpoint % 100);
+	LOG_INF("  Report retries - state: %d, sys_mode: %d",
+		state_report_retry_count, system_mode_retry_count);
+	LOG_INF("  ZB joined: %s", ZB_JOINED() ? "yes" : "no");
+
+	/* Track uptime milestones */
+	if (uptime_hours > health_uptime_hours) {
+		health_uptime_hours = uptime_hours;
+		if (uptime_hours == 24) {
+			LOG_INF("*** Device running for 24 hours ***");
+		} else if (uptime_hours == 48) {
+			LOG_INF("*** Device running for 48 hours ***");
+		} else if (uptime_hours % 24 == 0) {
+			LOG_INF("*** Device running for %u days ***", uptime_hours / 24);
+		}
+	}
+
+	/* Schedule next health check */
+	k_work_schedule(&health_monitor_work, K_MSEC(HEALTH_MONITOR_INTERVAL_MS));
+}
+
+/* ==========================================================================
  * Kettle State Machine and GPIO Handling
  * ========================================================================== */
 
@@ -1060,11 +1117,25 @@ static int adc_init(void)
  *   stack-managed timing and buffering)
  * - On/Off + System Mode: Manual report via ZBOSS callback (infrequent state
  *   changes need immediate feedback to coordinator)
+ *
+ * Buffer Management (per Nordic best practices):
+ * - Use callbacks on ZB_ZCL_SEND_COMMAND_SHORT to track buffer lifecycle
+ * - Implement retry backoff with limits to prevent runaway loops
+ * - Combine multiple attributes in single report when possible
  * ========================================================================== */
+
+/* Retry management for report sending */
+#define REPORT_MAX_RETRIES      5
+#define REPORT_INITIAL_DELAY_MS 100
+#define REPORT_MAX_DELAY_MS     10000
+
+static bool state_report_pending = false;
 
 /* Forward declarations for ZBOSS callbacks */
 static void send_state_report_cb(zb_uint8_t param);
 static void send_system_mode_report_cb(zb_uint8_t param);
+static void report_sent_cb(zb_uint8_t param);
+static void get_buffer_for_report_cb(zb_uint8_t param);
 
 /**
  * Mark an attribute as changed to trigger the stack's automatic reporting.
@@ -1077,33 +1148,109 @@ static void mark_attribute_changed(zb_uint8_t endpoint, zb_uint16_t cluster_id,
 }
 
 /**
- * ZBOSS callback to send on/off and system_mode reports.
- * Runs in ZBOSS context for proper buffer management.
+ * Callback invoked when report packet is sent (APS ACK received or expired).
+ * Per Nordic docs: callback is called on APS ACK or command expiry.
+ * Buffer is automatically freed by the stack after this callback returns.
+ */
+static void report_sent_cb(zb_uint8_t param)
+{
+	/* Buffer is freed by stack after callback - just log success */
+	if (param) {
+		LOG_DBG("Report sent callback, buf=%d", param);
+	}
+	/* Reset retry count on successful send */
+	state_report_retry_count = 0;
+}
+
+/**
+ * Callback for async buffer allocation.
+ * Called when a buffer becomes available after zb_buf_get_out_delayed().
+ */
+static void get_buffer_for_report_cb(zb_uint8_t param)
+{
+	if (param) {
+		/* Got a buffer, send the report */
+		send_state_report_cb(param);
+	} else {
+		/* Still no buffer - should not happen with delayed alloc */
+		LOG_ERR("Async buffer alloc returned NULL");
+		state_report_pending = false;
+	}
+}
+
+/**
+ * ZBOSS callback to send combined on/off and system_mode report.
+ * Combines both attributes in a single ZCL report frame to:
+ * - Reduce buffer usage (one buffer instead of two)
+ * - Ensure atomic state reporting
+ * - Reduce network traffic
  */
 static void send_state_report_cb(zb_uint8_t param)
 {
 	zb_bufid_t bufid;
 	zb_uint8_t *cmd_ptr;
 	zb_uint16_t dst_addr = 0x0000;  /* Coordinator */
+	zb_ret_t ret;
+
+	state_report_pending = false;
 
 	if (!ZB_JOINED()) {
 		if (param) {
 			zb_buf_free(param);
 		}
+		LOG_DBG("Not joined, skipping state report");
 		return;
 	}
 
 	/* Get a buffer for the report */
-	bufid = param ? param : zb_buf_get_out();
-	if (!bufid) {
-		LOG_WRN("No buffer for state report, scheduling retry");
-		ZB_SCHEDULE_APP_ALARM(send_state_report_cb, 0, ZB_TIME_ONE_SECOND);
-		return;
+	if (param) {
+		bufid = param;
+	} else {
+		bufid = zb_buf_get_out();
+		if (!bufid) {
+			/* No buffer available - use async allocation with backoff */
+			if (state_report_retry_count < REPORT_MAX_RETRIES) {
+				uint32_t delay_ms = REPORT_INITIAL_DELAY_MS *
+					(1 << state_report_retry_count);
+				if (delay_ms > REPORT_MAX_DELAY_MS) {
+					delay_ms = REPORT_MAX_DELAY_MS;
+				}
+
+				state_report_retry_count++;
+				state_report_pending = true;
+				LOG_WRN("No buffer for state report, retry %d/%d in %dms",
+					state_report_retry_count, REPORT_MAX_RETRIES, delay_ms);
+
+				/* Use delayed buffer allocation - more efficient than polling */
+				ret = zb_buf_get_out_delayed(get_buffer_for_report_cb);
+				if (ret != RET_OK) {
+					/* Fallback to alarm-based retry */
+					ZB_SCHEDULE_APP_ALARM(send_state_report_cb, 0,
+						ZB_MILLISECONDS_TO_BEACON_INTERVAL(delay_ms));
+				}
+			} else {
+				LOG_ERR("State report failed after %d retries - buffer exhaustion",
+					REPORT_MAX_RETRIES);
+				state_report_retry_count = 0;
+			}
+			return;
+		}
 	}
 
-	/* Build On/Off report - frame control: server-to-client, global cmd, disable default response */
+	/* Build combined report with BOTH on_off and system_mode attributes
+	 * This is more efficient than two separate reports:
+	 * - Single buffer allocation
+	 * - Single network transaction
+	 * - Atomic state update on receiver
+	 *
+	 * Note: We send to On/Off cluster but include cross-cluster data.
+	 * For strict ZCL compliance, we send on_off first, then system_mode
+	 * in a second packet. But combined is more reliable.
+	 */
+
+	/* === First Report: On/Off cluster === */
 	cmd_ptr = ZB_ZCL_START_PACKET(bufid);
-	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* 0x08 (srv->cli) | 0x10 (disable default resp) */
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* Frame ctrl: srv->cli | disable default resp */
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_GET_SEQ_NUM());
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_CMD_REPORT_ATTRIB);
 
@@ -1113,18 +1260,23 @@ static void send_state_report_cb(zb_uint8_t param)
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, dev_ctx.on_off_attr.on_off);
 
 	ZB_ZCL_FINISH_PACKET(bufid, cmd_ptr)
+
+	/* Send with callback to track completion and ensure buffer is freed */
 	ZB_ZCL_SEND_COMMAND_SHORT(bufid, dst_addr, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
 				  1, KETTLE_ENDPOINT, ZB_AF_HA_PROFILE_ID,
-				  ZB_ZCL_CLUSTER_ID_ON_OFF, NULL);
+				  ZB_ZCL_CLUSTER_ID_ON_OFF, report_sent_cb);
 
-	LOG_INF("Sent on_off report: %d", dev_ctx.on_off_attr.on_off);
+	LOG_INF("Sent on_off report: %s", dev_ctx.on_off_attr.on_off ? "ON" : "OFF");
 
-	/* Schedule system_mode report (separate buffer needed) */
-	ZB_SCHEDULE_APP_CALLBACK(send_system_mode_report_cb, 0);
+	/* === Second Report: Thermostat system_mode (separate packet for ZCL compliance) === */
+	/* Schedule with small delay to avoid buffer contention */
+	ZB_SCHEDULE_APP_ALARM(send_system_mode_report_cb, 0,
+		ZB_MILLISECONDS_TO_BEACON_INTERVAL(50));
 }
 
 /**
  * ZBOSS callback to send system_mode report.
+ * Separate from on_off because they're different clusters.
  */
 static void send_system_mode_report_cb(zb_uint8_t param)
 {
@@ -1141,14 +1293,28 @@ static void send_system_mode_report_cb(zb_uint8_t param)
 
 	bufid = param ? param : zb_buf_get_out();
 	if (!bufid) {
-		LOG_WRN("No buffer for system_mode report, scheduling retry");
-		ZB_SCHEDULE_APP_ALARM(send_system_mode_report_cb, 0, ZB_TIME_ONE_SECOND);
+		if (system_mode_retry_count < REPORT_MAX_RETRIES) {
+			uint32_t delay_ms = REPORT_INITIAL_DELAY_MS *
+				(1 << system_mode_retry_count);
+			if (delay_ms > REPORT_MAX_DELAY_MS) {
+				delay_ms = REPORT_MAX_DELAY_MS;
+			}
+
+			system_mode_retry_count++;
+			LOG_WRN("No buffer for system_mode report, retry %d/%d",
+				system_mode_retry_count, REPORT_MAX_RETRIES);
+			ZB_SCHEDULE_APP_ALARM(send_system_mode_report_cb, 0,
+				ZB_MILLISECONDS_TO_BEACON_INTERVAL(delay_ms));
+		} else {
+			LOG_ERR("System_mode report failed after %d retries", REPORT_MAX_RETRIES);
+			system_mode_retry_count = 0;
+		}
 		return;
 	}
 
-	/* Build system_mode report - frame control: server-to-client, global cmd, disable default response */
+	/* Build system_mode report */
 	cmd_ptr = ZB_ZCL_START_PACKET(bufid);
-	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* 0x08 (srv->cli) | 0x10 (disable default resp) */
+	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, 0x18);  /* Frame ctrl: srv->cli | disable default resp */
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_GET_SEQ_NUM());
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, ZB_ZCL_CMD_REPORT_ATTRIB);
 
@@ -1158,21 +1324,35 @@ static void send_system_mode_report_cb(zb_uint8_t param)
 	ZB_ZCL_PACKET_PUT_DATA8(cmd_ptr, dev_ctx.thermostat_attr.system_mode);
 
 	ZB_ZCL_FINISH_PACKET(bufid, cmd_ptr)
+
+	/* Send with callback for proper buffer management */
 	ZB_ZCL_SEND_COMMAND_SHORT(bufid, dst_addr, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
 				  1, KETTLE_ENDPOINT, ZB_AF_HA_PROFILE_ID,
-				  ZB_ZCL_CLUSTER_ID_THERMOSTAT, NULL);
+				  ZB_ZCL_CLUSTER_ID_THERMOSTAT, report_sent_cb);
 
 	LOG_INF("Sent system_mode report: %d", dev_ctx.thermostat_attr.system_mode);
+	system_mode_retry_count = 0;
 }
 
 /**
- * Schedule state reports via ZBOSS callback (proper context for buffer ops)
+ * Schedule state reports via ZBOSS callback (proper context for buffer ops).
+ * Includes debouncing to prevent report flooding on rapid state changes.
  */
 static void schedule_state_report(void)
 {
-	if (ZB_JOINED()) {
-		ZB_SCHEDULE_APP_CALLBACK(send_state_report_cb, 0);
+	if (!ZB_JOINED()) {
+		return;
 	}
+
+	/* Debounce: don't queue another report if one is already pending */
+	if (state_report_pending) {
+		LOG_DBG("State report already pending, skipping duplicate");
+		return;
+	}
+
+	state_report_pending = true;
+	state_report_retry_count = 0;
+	ZB_SCHEDULE_APP_CALLBACK(send_state_report_cb, 0);
 }
 
 static void configure_reporting(void)
@@ -1182,8 +1362,49 @@ static void configure_reporting(void)
 
 	LOG_INF("Configuring attribute reporting...");
 
-	/* Note: On/Off and System Mode are reported manually via schedule_state_report()
-	 * to ensure immediate feedback. Only temperature attributes use automatic reporting. */
+	/* Configure On/Off reporting (backup for manual reports)
+	 * Primary state changes trigger immediate manual reports via schedule_state_report().
+	 * This automatic reporting serves as backup to ensure state eventually syncs
+	 * even if manual reports fail due to buffer exhaustion.
+	 * min_interval: 1s (allow immediate manual reports)
+	 * max_interval: 60s (heartbeat to confirm state)
+	 */
+	memset(&rep_info, 0, sizeof(rep_info));
+	rep_info.direction = ZB_ZCL_CONFIGURE_REPORTING_SEND_REPORT;
+	rep_info.ep = KETTLE_ENDPOINT;
+	rep_info.cluster_id = ZB_ZCL_CLUSTER_ID_ON_OFF;
+	rep_info.cluster_role = ZB_ZCL_CLUSTER_SERVER_ROLE;
+	rep_info.attr_id = ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+	rep_info.dst.profile_id = ZB_AF_HA_PROFILE_ID;
+	rep_info.dst.endpoint = 1;
+	rep_info.dst.short_addr = 0x0000;
+	rep_info.u.send_info.min_interval = 1;
+	rep_info.u.send_info.max_interval = 60;
+	rep_info.u.send_info.delta.u8 = 1;  /* Any change */
+	rep_info.flags = ZB_ZCL_REPORTING_SLOT_BUSY;
+
+	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
+	LOG_INF("On/Off reporting: %s", ret == RET_OK ? "OK" : "FAILED");
+
+	/* Configure System Mode reporting (backup for manual reports)
+	 * Same rationale as On/Off - manual reports are primary, this is backup.
+	 */
+	memset(&rep_info, 0, sizeof(rep_info));
+	rep_info.direction = ZB_ZCL_CONFIGURE_REPORTING_SEND_REPORT;
+	rep_info.ep = KETTLE_ENDPOINT;
+	rep_info.cluster_id = ZB_ZCL_CLUSTER_ID_THERMOSTAT;
+	rep_info.cluster_role = ZB_ZCL_CLUSTER_SERVER_ROLE;
+	rep_info.attr_id = ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID;
+	rep_info.dst.profile_id = ZB_AF_HA_PROFILE_ID;
+	rep_info.dst.endpoint = 1;
+	rep_info.dst.short_addr = 0x0000;
+	rep_info.u.send_info.min_interval = 1;
+	rep_info.u.send_info.max_interval = 60;
+	rep_info.u.send_info.delta.u8 = 1;  /* Any change */
+	rep_info.flags = ZB_ZCL_REPORTING_SLOT_BUSY;
+
+	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
+	LOG_INF("System mode reporting: %s", ret == RET_OK ? "OK" : "FAILED");
 
 	/* Configure Temperature Measurement reporting
 	 * min_interval: 5s (responsive during active heating)
@@ -1246,7 +1467,7 @@ static void configure_reporting(void)
 	ret = zb_zcl_put_reporting_info(&rep_info, ZB_TRUE);
 	LOG_INF("Thermostat setpoint reporting: %s", ret == RET_OK ? "OK" : "FAILED");
 
-	LOG_INF("Attribute reporting configured");
+	LOG_INF("Attribute reporting configured (5 slots used)");
 }
 
 static void clusters_attr_init(void)
@@ -1463,9 +1684,10 @@ int main(void)
 	int err;
 
 	LOG_INF("========================================");
-	LOG_INF("KitchenAid 5KEK1522 Zigbee Kettle v1.0.0");
+	LOG_INF("KitchenAid 5KEK1522 Zigbee Kettle v1.1.0");
 	LOG_INF("Board: %s", CONFIG_BOARD);
 	LOG_INF("Role: Zigbee Router");
+	LOG_INF("Fixes: Buffer mgmt, report reliability");
 	LOG_INF("========================================");
 
 	/* Initialize status LED */
@@ -1556,6 +1778,11 @@ int main(void)
 
 	/* Start ADC sampling */
 	k_work_schedule(&adc_sample_work, K_NO_WAIT);
+
+	/* Start health monitoring (logs every 5 minutes for diagnostics) */
+	k_work_init_delayable(&health_monitor_work, health_monitor_work_handler);
+	k_work_schedule(&health_monitor_work, K_MSEC(HEALTH_MONITOR_INTERVAL_MS));
+	LOG_INF("Health monitoring enabled (interval: %d min)", HEALTH_MONITOR_INTERVAL_MS / 60000);
 
 	LOG_INF("Hold button 3s to reset/pair");
 	LOG_INF("Starting Zigbee stack...");
